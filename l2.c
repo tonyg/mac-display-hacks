@@ -59,6 +59,12 @@ static void setup_screen(void) {
   screen.stride = f.line_length / sizeof(uint32_t);
   screen.width = v.xres;
   screen.height = v.yres;
+  v.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+  if (ioctl(fb, FBIOPUT_VSCREENINFO, &v) < 0) {
+    perror("ioctl FBIOPUT_VSCREENINFO");
+    close(fb);
+    exit(1);
+  }
 }
 
 static void clrscr(void) {

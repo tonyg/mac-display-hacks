@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -15,10 +16,11 @@
 #include <sys/ioctl.h>
 
 #include <linux/fb.h>
+#include <linux/input.h>
 
 static struct screen {
-  uint32_t *base;
-  uint32_t *shadow;
+  uint16_t *base;
+  uint16_t *shadow;
   int width;
   int height;
   int stride;
@@ -32,15 +34,16 @@ typedef struct Point {
 #define N_PARTICLES 50000
 #define ERASE_TRACKS 0
 #define WANT_FADE 1
-#define WANT_REPLACEMENTS 0
+#define WANT_REPLACEMENTS 1
+#define FRAME_RATE_TARGET 30
 
-#define FADE_FACTOR 0.999
+#define FADE_FACTOR 0.95
 
 #define N_MASSES 2
 
 #define MAX_COLOR 1024
 
-#define VEL_SCALE 4
+#define VEL_SCALE 6
 #define MASS_CLIP 0 /* 400 */
 
 #define M1 1000
@@ -57,14 +60,16 @@ static struct mass {
 
 #define DEAD_PARTICLE_MARKER 1000000
 
-static uint32_t colors[MAX_COLOR];
+static uint16_t colors[MAX_COLOR];
 
 static int frame_counter = 0;
 
+static struct fb_var_screeninfo v;
+static int fb;
+
 static void setup_screen(void) {
   struct fb_fix_screeninfo f;
-  struct fb_var_screeninfo v;
-  int fb = open("/dev/fb0", O_RDWR);
+  fb = open("/dev/fb0", O_RDWR);
   if (fb < 0) {
     perror("open /dev/fb0");
     exit(1);
@@ -85,10 +90,17 @@ static void setup_screen(void) {
     close(fb);
     exit(1);
   }
-  screen.stride = f.line_length / sizeof(uint32_t);
+  screen.stride = f.line_length / sizeof(uint16_t);
   screen.width = v.xres;
   screen.height = v.yres;
-  screen.shadow = malloc(screen.stride * screen.height * sizeof(uint32_t));
+  screen.shadow = malloc(screen.stride * screen.height * sizeof(uint16_t));
+  printf("bpp %d\n", v.bits_per_pixel);
+  v.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+  if (ioctl(fb, FBIOPUT_VSCREENINFO, &v) < 0) {
+    perror("ioctl FBIOPUT_VSCREENINFO");
+    close(fb);
+    exit(1);
+  }
 }
 
 static void init_particle(struct particle *p) {
@@ -107,8 +119,8 @@ static void setup_particles(void) {
   }
 }
 
-static int mkcolor(int R, int G, int B) {
-  return (R << 16) | (G << 8) | B;
+static uint16_t mkcolor(int R, int G, int B) {
+  return (((R & 0xFF) >> 3) << 11) | (((G & 0xFF) >> 2) << 5) | (((B & 0xFF) >> 3) << 0);
 }
 
 static void setup_colors(void) {
@@ -126,7 +138,7 @@ static void setup_colors(void) {
 static void clrscr(void) {
   memset(screen.shadow,
 	 0,
-	 ((screen.height-1) * screen.stride + screen.width) * sizeof(uint32_t));
+	 ((screen.height-1) * screen.stride + screen.width) * sizeof(uint16_t));
 }
 
 static void putpixel(int x, int y, int c) {
@@ -137,13 +149,8 @@ static int getpixel(int x, int y) {
   return screen.shadow[y * screen.stride + x];
 }
 
-static void do_frame() {
-  Point loc;
+static void do_frame(Point loc) {
   int x, y, c;
-
-  //GetMouse(&loc);
-  loc.h = 100;
-  loc.v = 100;
 
   if (frame_counter == 0) {
     clrscr();
@@ -154,13 +161,13 @@ static void do_frame() {
       for (x = 0; x < screen.width; x++) {
 	int p = getpixel(x, y);
 	if (p) {
-	  int R = (p >> 16) & 0xff;
-	  int G = (p >> 8) & 0xff;
-	  int B = p & 0xff;
+	  int R = (p >> 11) & 0x1f;
+	  int G = (p >> 5) & 0x3f;
+	  int B = p & 0x1f;
 	  R = (int) R * FADE_FACTOR;
 	  G = (int) G * FADE_FACTOR;
 	  B = (int) B * FADE_FACTOR;
-	  p = (R << 16) | (G << 8) | B;
+	  p = (R << 11) | (G << 5) | B;
 	  putpixel(x, y, p);
 	}
       }
@@ -236,6 +243,21 @@ static void do_frame() {
 
 int main(int argc, char *argv[]) {
   struct timeval t_start, t_stop;
+  int inputfd = open("/dev/input/event1", O_RDONLY);
+  if (inputfd < 0) perror("open /dev/input/event1");
+  {
+    int flags = fcntl(inputfd, F_GETFL, 0);
+    flags |= O_NONBLOCK;
+    if (fcntl(inputfd, F_SETFL, flags) < 0) perror("fcntl");
+  }
+  struct input_absinfo iinfo;
+  if (ioctl(inputfd, EVIOCGABS(ABS_MT_POSITION_X), &iinfo) < 0) perror("ioctl ABS_MT_POSITION_X");
+  uint32_t max_x = iinfo.maximum;
+  printf("X %d %d\n", iinfo.minimum, iinfo.maximum);
+  if (ioctl(inputfd, EVIOCGABS(ABS_MT_POSITION_Y), &iinfo) < 0) perror("ioctl ABS_MT_POSITION_Y");
+  uint32_t max_y = iinfo.maximum;
+  printf("Y %d %d\n", iinfo.minimum, iinfo.maximum);
+  uint32_t curr_x, curr_y;
 
   setup_screen();
   setup_colors();
@@ -247,15 +269,55 @@ int main(int argc, char *argv[]) {
 
   frame_counter = 0;
   while (1) {
-    do_frame();
-    memcpy(screen.base, screen.shadow, screen.stride * screen.height * sizeof(uint32_t));
+    do_frame((Point) {
+	.h = curr_x * v.xres / max_x,
+			.v = curr_y * v.yres / max_y
+      });
+    memcpy(screen.base, screen.shadow, screen.stride * screen.height * sizeof(uint16_t));
     frame_counter++;
+
+    if (ioctl(fb, FBIOPAN_DISPLAY, &v) < 0) {
+      perror("ioctl FBIOPAN_DISPLAY");
+      close(fb);
+      exit(1);
+    }
+
+    {
+      struct input_event buf;
+      unsigned int count = 0;
+      ssize_t result;
+      while ((result = read(inputfd, &buf, sizeof(buf))) == sizeof(buf)) {
+	count++;
+	switch (buf.type) {
+	case EV_ABS:
+	  switch (buf.code) {
+	  case ABS_MT_POSITION_X:
+	    curr_x = buf.value;
+	    break;
+	  case ABS_MT_POSITION_Y:
+	    curr_y = buf.value;
+	    break;
+	  default:
+	    break;
+	  }
+	  // fall through
+	default:
+	  printf("%u %u %d. ", buf.type, buf.code, buf.value);
+	}
+      }
+      if (result != -1) printf("result read %ld\n", (long) result);
+      if (errno != EWOULDBLOCK) perror("read inputfd");
+      if (count > 0) printf("\n");
+    }
 
     {
       struct timeval t_now;
       gettimeofday(&t_now, NULL);
       signed long d = (t_now.tv_sec - t_start.tv_sec) * 1000000 + (t_now.tv_usec - t_start.tv_usec);
-      long nap = frame_counter * (1000000 / 75) - d;
+      if ((frame_counter % FRAME_RATE_TARGET) == 0) {
+	printf("actual %ld target %d\n", FRAME_RATE_TARGET * 1000000 / (d / (frame_counter / FRAME_RATE_TARGET)), FRAME_RATE_TARGET);
+      }
+      long nap = frame_counter * (1000000 / FRAME_RATE_TARGET) - d;
       if (nap > 0) {
     	usleep(nap);
       }
